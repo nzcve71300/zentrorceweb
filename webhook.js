@@ -15,11 +15,15 @@ const db = new sqlite3.Database('./data.db');
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS server_configs (
     server_id TEXT PRIMARY KEY,
+    guild_id TEXT,
     rcon_ip TEXT,
     rcon_port INTEGER,
     rcon_password TEXT,
     subscription_id TEXT,
+    subscription_plan TEXT,
     subscription_status TEXT DEFAULT 'inactive',
+    subscription_end_date INTEGER,
+    is_active INTEGER DEFAULT 0,
     trial_end_date TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
@@ -30,6 +34,16 @@ db.serialize(() => {
     status TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS rust_servers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT,
+    admin_id TEXT,
+    server_name TEXT,
+    rcon_ip TEXT,
+    rcon_port INTEGER,
+    rcon_password TEXT
   )`);
 });
 
@@ -52,6 +66,10 @@ app.post('/webhook/paypal', async (req, res) => {
         
       case 'BILLING.SUBSCRIPTION.CANCELLED':
         await handleSubscriptionCancelled(event);
+        break;
+        
+      case 'BILLING.SUBSCRIPTION.UPDATED':
+        await handleSubscriptionUpdated(event);
         break;
         
       case 'PAYMENT.SALE.COMPLETED':
@@ -122,6 +140,113 @@ async function handleSubscriptionCancelled(event) {
   });
 }
 
+// Handle subscription updates (upgrades/downgrades)
+async function handleSubscriptionUpdated(event) {
+  const subscriptionId = event.resource.id;
+  const planId = event.resource.plan_id;
+  const status = event.resource.status;
+  
+  console.log(`Subscription ${subscriptionId} updated - Plan: ${planId}, Status: ${status}`);
+  
+  // Get the new plan limit based on plan_id
+  const planLimits = {
+    'P-1SERVER': 1,
+    'P-5SERVERS': 5,
+    'P-10SERVERS': 10
+  };
+  
+  const newLimit = planLimits[planId] || 1;
+  console.log(`New plan limit: ${newLimit} servers`);
+  
+  return new Promise((resolve, reject) => {
+    // Update subscription in database
+    db.run(
+      `UPDATE subscriptions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE subscription_id = ?`,
+      [status, subscriptionId],
+      (err) => {
+        if (err) {
+          console.error('Error updating subscription:', err);
+          reject(err);
+        } else {
+          console.log(`Subscription ${subscriptionId} updated successfully`);
+          
+          // Find guild_id for this subscription and handle downgrade
+          db.get('SELECT guild_id FROM server_configs WHERE subscription_id = ?', [subscriptionId], (err, config) => {
+            if (err || !config) {
+              console.error('No server config found for subscription:', subscriptionId);
+              resolve();
+              return;
+            }
+            
+            // Handle automatic downgrade if needed
+            handleSubscriptionDowngrade(config.guild_id, newLimit);
+            resolve();
+          });
+        }
+      }
+    );
+  });
+}
+
+// Handle automatic subscription downgrades
+function handleSubscriptionDowngrade(guildId, newLimit) {
+  console.log(`Checking for downgrade: Guild ${guildId}, new limit: ${newLimit}`);
+  
+  // Get current server count for this guild
+  db.get('SELECT COUNT(*) as count FROM rust_servers WHERE guild_id = ?', [guildId], (err, result) => {
+    if (err) {
+      console.error('Failed to get server count:', err);
+      return;
+    }
+    
+    const currentCount = result.count;
+    console.log(`Current server count: ${currentCount}, New limit: ${newLimit}`);
+    
+    if (currentCount > newLimit) {
+      console.log(`Downgrade detected! Removing ${currentCount - newLimit} excess servers`);
+      
+      // Get servers to remove (oldest first)
+      db.all('SELECT * FROM rust_servers WHERE guild_id = ? ORDER BY id ASC LIMIT ?', 
+        [guildId, currentCount - newLimit], (err, serversToRemove) => {
+        if (err) {
+          console.error('Failed to get servers to remove:', err);
+          return;
+        }
+        
+        // Remove excess servers
+        serversToRemove.forEach(server => {
+          db.run('DELETE FROM rust_servers WHERE id = ?', [server.id], (err) => {
+            if (err) {
+              console.error(`Failed to remove server ${server.server_name}:`, err);
+            } else {
+              console.log(`Removed server: ${server.server_name} (ID: ${server.id}) due to downgrade`);
+            }
+          });
+        });
+        
+        // Send notification about downgrade
+        sendDowngradeNotification(guildId, newLimit, serversToRemove.length);
+      });
+    } else {
+      console.log('No downgrade needed - server count is within limits');
+    }
+  });
+}
+
+// Send downgrade notification
+function sendDowngradeNotification(guildId, newLimit, removedCount) {
+  console.log(`Downgrade notification: Guild ${guildId}, new limit: ${newLimit}, removed: ${removedCount} servers`);
+  
+  // This would send a Discord notification about the downgrade
+  // You can implement this using your Discord bot client
+  // Example:
+  // const { EmbedBuilder } = require('discord.js');
+  // const embed = new EmbedBuilder()
+  //   .setColor('#ff7f00')
+  //   .setTitle('Subscription Downgrade')
+  //   .setDescription(`Your subscription has been updated. You can now have up to ${newLimit} servers.\n\n${removedCount} excess servers have been automatically removed.`);
+}
+
 // Handle payment completion
 async function handlePaymentCompleted(event) {
   const subscriptionId = event.resource.billing_agreement_id;
@@ -176,14 +301,23 @@ async function handlePaymentDenied(event) {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'Zentro Webhook Server Running',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    features: [
+      'PayPal webhook processing',
+      'Automatic subscription management',
+      'Server limit enforcement',
+      'Downgrade handling'
+    ]
   });
 });
 
 // Start server
-app.listen(PORT, () => {
-  console.log(`Zentro webhook server running on port ${PORT}`);
-  console.log(`Webhook URL: http://localhost:${PORT}/webhook/paypal`);
-});
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`Zentro webhook server running on port ${PORT}`);
+    console.log(`Webhook URL: http://localhost:${PORT}/webhook/paypal`);
+    console.log(`Health check: http://localhost:${PORT}/`);
+  });
+}
 
 module.exports = app; 
