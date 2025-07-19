@@ -1,0 +1,12 @@
+{
+  "name": "zentro-webhook",
+  "version": "1.0.0",
+  "main": "webhook.js",
+  "dependencies": {
+    "express": "^4.18.2",
+    "sqlite3": "^5.1.7"
+  },
+  "scripts": {
+    "start": "node webhook.js"
+  }
+} 
